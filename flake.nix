@@ -4,7 +4,7 @@
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
 
   outputs =
-    { self, nixpkgs }:
+    { nixpkgs, ... }:
     let
       # The bundled engines and e-board drivers are prebuilt x86_64 Linux binaries.
       system = "x86_64-linux";
@@ -30,44 +30,52 @@
         ps.pyside6
         ps.requests
         ps.sortedcontainers
+        fastercode
       ];
       pythonEnv = python.withPackages pythonDeps;
 
+      # Qt plugins for PySide6: platforms, SVG, multimedia (sounds). No
+      # qtwayland: run_gui() forces QT_QPA_PLATFORM=xcb on Wayland sessions.
+      qtModules = [
+        pkgs.qt6.qtbase
+        pkgs.qt6.qtsvg
+        pkgs.qt6.qtmultimedia
+      ];
+
       # Rebuilt from source: the committed .so only loads on CPython 3.12.
-      fastercode = pkgs.stdenv.mkDerivation {
-        pname = "lucaschess-fastercode";
-        inherit version;
-        src = ./bin/_fastercode/src;
+      # Unversioned, so a release that doesn't touch bin/_fastercode reuses the build.
+      fastercode = python.pkgs.toPythonModule (
+        pkgs.stdenv.mkDerivation {
+          name = "lucaschess-fastercode";
+          src = ./bin/_fastercode;
 
-        nativeBuildInputs = [
-          (python.withPackages (ps: [
-            ps.cython
-            ps.setuptools
-          ]))
-        ];
+          nativeBuildInputs = [
+            (python.withPackages (ps: [
+              ps.cython
+              ps.setuptools
+            ]))
+          ];
 
-        # irina/defs.h has `typedef char bool`, an error under GCC 15's default C23.
-        env.NIX_CFLAGS_COMPILE = "-std=gnu17";
+          # irina/defs.h has `typedef char bool`, an error under GCC 15's default C23.
+          env.NIX_CFLAGS_COMPILE = "-std=gnu17";
 
-        # Same steps as fastercode_linux.sh; setup_linux.py uses distutils, gone since 3.12.
-        buildPhase = ''
-          runHook preBuild
-          (cd irina && $CC -O2 -fPIC -fno-strict-aliasing -DNDEBUG -c *.c && $AR rcs ../libirina.a *.o)
-          cat Faster_Irina.pyx Faster_Polyglot.pyx > FasterCode.pyx
-          python -c '
-          from setuptools import setup, Extension
-          from Cython.Build import cythonize
-          setup(ext_modules=cythonize([Extension("FasterCode", ["FasterCode.pyx"], libraries=["irina"], library_dirs=["."])]))
-          ' build_ext --inplace
-          runHook postBuild
-        '';
+          # Upstream's script as is: setuptools supplies the distutils that
+          # setup_linux.py imports. -e because the script doesn't stop on errors.
+          buildPhase = ''
+            runHook preBuild
+            bash -e fastercode_linux.sh
+            runHook postBuild
+          '';
 
-        installPhase = ''
-          runHook preInstall
-          install -Dm555 -t $out FasterCode*.so
-          runHook postInstall
-        '';
-      };
+          # Under lib/, where the default strip hook looks: unstripped debug info
+          # would keep gcc and glibc-dev in the closure.
+          installPhase = ''
+            runHook preInstall
+            install -Dm555 -t $out/${python.sitePackages} src/FasterCode*.so
+            runHook postInstall
+          '';
+        }
+      );
 
       # The read-only program tree: bin/ and Resources/ as upstream lays them out.
       unwrapped = pkgs.stdenv.mkDerivation {
@@ -76,12 +84,19 @@
 
         src = lib.fileset.toSource {
           root = ./.;
-          fileset = lib.fileset.difference (lib.fileset.unions [
+          fileset = lib.fileset.unions [
             ./bin/LucasR.py
             ./bin/Code
-            ./bin/OS/linux
             ./Resources
-          ]) (lib.fileset.fileFilter (f: lib.hasPrefix "FasterCode." f.name) ./bin/OS/linux);
+            (lib.fileset.difference ./bin/OS/linux (
+              lib.fileset.unions [
+                # Rebuilt from source and loaded from pythonEnv instead.
+                (lib.fileset.fileFilter (f: lib.hasPrefix "FasterCode." f.name) ./bin/OS/linux)
+                # Use qtbase's PrintSupport, matching the Qt that PySide6 loads.
+                ./bin/OS/linux/DigitalBoards/libQt6PrintSupport.so.6
+              ]
+            ))
+          ];
         };
 
         nativeBuildInputs = [
@@ -106,8 +121,9 @@
 
         # Only libnut.so (Novag UCB e-board) wants Qt5Pas, which isn't shipped.
         autoPatchelfIgnoreMissingDeps = [ "libQt5Pas.so.1" ];
+        # Nothing to wrap here, but qtbase's setup hook fails the build unless
+        # this is set or wrapQtAppsHook is present.
         dontWrapQtApps = true;
-        dontStrip = true;
 
         postPatch = ''
           # Files copied out of the store keep its read-only mode, and the app
@@ -140,15 +156,11 @@
           share=$out/share/lucaschess
           mkdir -p $share
           cp -r bin Resources $share/
-          cp ${fastercode}/FasterCode*.so $share/bin/OS/linux/
-
-          # Use qtbase's PrintSupport, matching the Qt that PySide6 loads.
-          rm $share/bin/OS/linux/DigitalBoards/libQt6PrintSupport.so.6
 
           # Engines are committed without the exec bit and read_engines() chmods
           # them at startup, which would fail in the store.
           find $share/bin/OS/linux/Engines -type f -print0 | while IFS= read -r -d "" f; do
-            if [ "$(head -c4 "$f" | tail -c3 | tr -d '\0')" = ELF ]; then chmod +x "$f"; fi
+            if isELF "$f"; then chmod +x "$f"; fi
           done
 
           # Two bundled game databases are in WAL mode, which needs -shm/-wal files
@@ -167,7 +179,10 @@
                   print("converted from WAL:", p)
           EOF
 
-          # The launcher runs with PYTHONOPTIMIZE=1; hash-less pycs ignore store mtimes.
+          # The launcher runs with PYTHONOPTIMIZE=1. Hash-based pycs don't depend on
+          # the mtimes the store resets, and unchecked ones aren't rehashed on import.
+          # No -j: worker processes marshal some pycs differently from a serial run,
+          # so the output would depend on the builder's core count.
           python -m compileall -q -o 1 --invalidation-mode unchecked-hash \
             $share/bin/Code $share/bin/OS/linux/OSEngines.py
           runHook postInstall
@@ -179,7 +194,7 @@
       # So we run from a writable mirror of the tree whose read-only parts are
       # symlinks into the store.
       launcher = pkgs.writeShellApplication {
-        name = "lucaschess";
+        name = "lucaschess-launcher";
         runtimeInputs = [
           pkgs.coreutils
           pkgs.diffutils
@@ -204,32 +219,43 @@
             fi
           }
 
-          mkdir -p "$root/bin/OS/linux" "$root/UserData"
-          link "$share/Resources" "$root/Resources"
-          link "$share/bin/Code" "$root/bin/Code"
+          # The mirror only changes when the store path does, so skip the checks
+          # below on an ordinary start. Delete .store-path to force them. bin/Code
+          # is tested too: launchers from builds without the stamp relink the
+          # mirror to their own tree and leave the stamp alone.
+          stamp=$root/.store-path
+          prev=
+          if [[ -f $stamp ]]; then read -r prev < "$stamp" || true; fi
+          if [[ $prev != "$share" || ! $root/bin/Code -ef $share/bin/Code ]]; then
+            mkdir -p "$root/bin/OS/linux" "$root/UserData"
+            link "$share/Resources" "$root/Resources"
+            link "$share/bin/Code" "$root/bin/Code"
 
-          # Drop links left by a previous version, then link this one.
-          for f in "$root/bin/OS/linux"/*; do
-            if [[ -L $f && "$(readlink "$f")" != "$share"/* ]]; then
-              rm -f "$f"
+            # Drop links left by a previous version, then link this one.
+            for f in "$root/bin/OS/linux"/*; do
+              if [[ -L $f && "$(readlink "$f")" != "$share"/* ]]; then
+                rm -f "$f"
+              fi
+            done
+            for f in "$share/bin/OS/linux"/*; do
+              name=$(basename "$f")
+              if [[ $name != uci_options.sqlite ]]; then
+                link "$f" "$root/bin/OS/linux/$name"
+              fi
+            done
+
+            # Writable: internal engines' UCI options are cached here on first use.
+            if [[ ! -e "$root/bin/OS/linux/uci_options.sqlite" ]]; then
+              install -m644 "$share/bin/OS/linux/uci_options.sqlite" "$root/bin/OS/linux/"
             fi
-          done
-          for f in "$share/bin/OS/linux"/*; do
-            name=$(basename "$f")
-            if [[ $name != uci_options.sqlite ]]; then
-              link "$f" "$root/bin/OS/linux/$name"
+
+            # A copy, not a link: Code/__init__.py finds bin/ via realpath(argv[0]).
+            if ! cmp -s "$share/bin/LucasR.py" "$root/bin/LucasR.py"; then
+              install -m644 "$share/bin/LucasR.py" "$root/bin/LucasR.py.tmp.$$"
+              mv -f "$root/bin/LucasR.py.tmp.$$" "$root/bin/LucasR.py"
             fi
-          done
 
-          # Writable: internal engines' UCI options are cached here on first use.
-          if [[ ! -e "$root/bin/OS/linux/uci_options.sqlite" ]]; then
-            install -m644 "$share/bin/OS/linux/uci_options.sqlite" "$root/bin/OS/linux/"
-          fi
-
-          # A copy, not a link: Code/__init__.py finds bin/ via realpath(argv[0]).
-          if ! cmp -s "$share/bin/LucasR.py" "$root/bin/LucasR.py"; then
-            install -m644 "$share/bin/LucasR.py" "$root/bin/LucasR.py.tmp.$$"
-            mv -f "$root/bin/LucasR.py.tmp.$$" "$root/bin/LucasR.py"
+            printf '%s\n' "$share" > "$stamp"
           fi
 
           cd "$root/bin"
@@ -263,13 +289,7 @@
           pkgs.copyDesktopItems
         ];
 
-        # Qt plugins for PySide6: platforms, SVG, multimedia (sounds). No
-        # qtwayland: run_gui() forces QT_QPA_PLATFORM=xcb on Wayland sessions.
-        buildInputs = [
-          pkgs.qt6.qtbase
-          pkgs.qt6.qtsvg
-          pkgs.qt6.qtmultimedia
-        ];
+        buildInputs = qtModules;
 
         desktopItems = [ desktopItem ];
         dontWrapQtApps = true;
@@ -287,7 +307,7 @@
         meta = {
           description = "Chess GUI for training, play against UCI engines and engine tournaments";
           homepage = "https://lucaschess.pythonanywhere.com";
-          license = lib.licenses.gpl3Only;
+          license = lib.licenses.gpl2Plus;
           mainProgram = "lucaschess";
           platforms = [ system ];
           # Bundles prebuilt engines and e-board drivers.
@@ -304,11 +324,6 @@
         default = lucaschess;
       };
 
-      apps.${system}.default = {
-        type = "app";
-        program = lib.getExe lucaschess;
-      };
-
       # For running from the checkout (python3 bin/LucasR.py) and rebuilding FasterCode.
       devShells.${system}.default = pkgs.mkShell {
         packages = [
@@ -321,7 +336,10 @@
             ]
           ))
         ];
-        inputsFrom = [ lucaschess ];
+        # The plugins of the package's qtModules, ahead of the session's.
+        shellHook = ''
+          export QT_PLUGIN_PATH=${lib.makeSearchPath pkgs.qt6.qtbase.qtPluginPrefix qtModules}''${QT_PLUGIN_PATH:+:$QT_PLUGIN_PATH}
+        '';
       };
     };
 }
