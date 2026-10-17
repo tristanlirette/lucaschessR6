@@ -7,8 +7,11 @@ GUI for training, play against UCI engines, and engine tournaments.
 ## Packaging notes
 
 **Everything is built from source.** Upstream's release tree bundles about 70
-prebuilt Linux engines, 19 prebuilt e-board driver libraries and a prebuilt
-`FasterCode` extension. None of them are installed.
+prebuilt Linux engines, 19 prebuilt e-board driver libraries, a Windows build
+and a prebuilt `FasterCode` extension. None of them are installed, and
+`postFetch` removes them from the source, so the binary cache doesn't
+redistribute them (several engines are closed source). That also shrinks the
+source from 1.1 GB to 263 MB.
 
 | Component | Handling |
 |---|---|
@@ -27,8 +30,14 @@ to its own `bin/`.
   those writes go there; when it's unset, behaviour is unchanged.
 - The wrapper defaults it to
   `${XDG_DATA_HOME:-$HOME/.local/share}/lucaschess`.
-- `absolute-file-arguments.patch` keeps relative file arguments working,
-  since Lucas Chess changes into its own directory at startup.
+  - That includes the engine UCI option cache, keyed there by the engine's
+    executable, so a Stockfish or lc0 update in nixpkgs isn't served stale
+    options.
+  - It also includes translation catalogs imported with the translator tool,
+    which then take precedence over the bundled ones.
+- `absolute-file-arguments.patch` keeps a relative file argument
+  (`lucaschess games/x.pgn`) working, since Lucas Chess changes into its own
+  directory at startup.
 - Both patches are written to be upstreamable. Upstream PR: (none yet).
 
 **Nix-specific patches:**
@@ -41,14 +50,17 @@ to its own `bin/`.
 - `postPatch` makes files copied out of the store writable (resources, piece
   sets, GM games), and disables the self-updater.
 
-With `LUCASCHESS_HOME` set, cached engine UCI options are keyed by the
-engine's executable. A Stockfish or lc0 update in nixpkgs is therefore
-picked up rather than served from a stale cache.
-
 **Python.** Lucas Chess re-executes `sys.executable LucasR.py -<mode>` for
-its helper processes (kibitzers, tournaments, …). The dependencies therefore
-reach the interpreter through `PYTHONPATH` in the wrapper, not through a
-wrapped script.
+its helper processes (kibitzers, tournaments, …). The launcher therefore runs
+a `python3.withPackages` interpreter, so the dependencies come with
+`sys.executable`. That avoids exporting a `PYTHONPATH`, which would leak into
+every engine Lucas Chess starts.
+
+**Licenses.** The license list covers:
+- Lucas Chess (GPL-3.0-only);
+- the three in-tree engines (GPL-3.0-or-later);
+- the piece sets that carry their own license (GPL-2.0-only, LGPL-2.0-only);
+- the Maia weights (GPL-3.0).
 
 **Platform.** `x86_64-linux` only, because FasterCode's `cpu_flags.c` uses
 x86 `cpuid`.
