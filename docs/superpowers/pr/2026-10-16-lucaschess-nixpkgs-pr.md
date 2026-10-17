@@ -36,9 +36,14 @@ to its own `bin/`.
   also hides the features that need Rodent II, which isn't shipped: the
   Rodent personalities menu, the "Indexes - RodentII" kibitzer and the
   default Rodent book. They would otherwise silently run another engine.
-  Albums fall back to Stockfish, which shows no engine name.
-- `postPatch` makes files copied out of the store writable, and disables the
-  self-updater.
+  Albums fall back to Stockfish, which shows no engine name. Saved Grid ELO
+  progress against engines that aren't shipped is kept aside, not deleted.
+- `postPatch` makes files copied out of the store writable (resources, piece
+  sets, GM games), and disables the self-updater.
+
+With `LUCASCHESS_HOME` set, cached engine UCI options are keyed by the
+engine's executable. A Stockfish or lc0 update in nixpkgs is therefore
+picked up rather than served from a stale cache.
 
 **Python.** Lucas Chess re-executes `sys.executable LucasR.py -<mode>` for
 its helper processes (kibitzers, tournaments, …). The dependencies therefore
