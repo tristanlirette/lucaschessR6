@@ -44,7 +44,7 @@ The launcher runs a `python3.withPackages` interpreter. Helper processes (kibitz
 - `nix-build -A lucaschess.tests`: launcher, UCI handshake of each engine, FasterCode, engine registry.
 - In the GUI: start-up, a game against Irina, analysis with Stockfish, Maia at two levels, a kibitzer, a short engine tournament.
 
-Written with Claude Code (Claude Opus 5.5). I reviewed and tested it, and will maintain the package.
+Written with Claude Opus 5.5.
 
 ## Things done
 
